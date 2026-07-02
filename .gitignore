@@ -8,6 +8,7 @@ __pycache__/
 
 # Logged data (machine-generated, can get large)
 qld_prices.csv
+qld_decisions.csv
 
 # Mac clutter
 .DS_Store

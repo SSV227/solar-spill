@@ -364,6 +364,111 @@ def run_strategy(name, fleet, df, cfg, rng):
 
 
 # ----------------------------------------------------------------------------
+# COORDINATED strategies (need cross-car state — the fleet is scheduled jointly,
+# not car-by-car). These are the "solution" tier: they see the LOCAL transformer.
+# ----------------------------------------------------------------------------
+
+def _finalise(name, masks, fleet, df, cfg):
+    """Turn a list of per-car boolean masks into the standard result dict."""
+    n_grid = len(df)
+    prices = df["price"].values
+    ev_load = np.zeros(n_grid)
+    costs = np.zeros(len(fleet))
+    deadline_met = np.zeros(len(fleet), bool)
+    per_car_peak_sum = 0.0
+    for ci in range(len(fleet)):
+        car = fleet.iloc[ci]
+        m = masks[ci]
+        ev_load += m * car.charger_kw
+        per_car_peak_sum += car.charger_kw if m.any() else 0.0
+        on = np.where(m)[0]
+        # deadline met if we scheduled enough intervals and all land in-window
+        enough = m.sum() >= car.intervals_needed
+        in_window = (len(on) == 0) or (on.max() <= car.dead_idx)
+        deadline_met[ci] = enough and in_window
+        costs[ci] = np.sum(m * car.kwh_per_interval * prices / 1000.0)
+    return {"name": name, "ev_load": ev_load, "costs": costs,
+            "deadline_met": deadline_met, "per_car_peak_sum": per_car_peak_sum}
+
+
+def run_capped(name, fleet, df, cfg):
+    """CENTRAL CAP (theoretical best). A coordinator hands out charging slots
+    cheapest-first, but never lets more cars charge in a 5-min interval than the
+    transformer can physically carry (rating minus the household baseline).
+    Tightest-deadline cars get first pick. Guarantees no overload by construction
+    while keeping cost low and deadlines met."""
+    n_grid = len(df)
+    prices = df["price"].values
+    baseline = baseline_load(df, cfg)                 # local load already on the box
+    slots = np.floor((cfg.transformer_kva - baseline) / cfg.charger_kw).astype(int)
+    slots = np.maximum(slots, 0)                       # EV slots available per interval
+    committed = np.zeros(n_grid, int)
+    masks = [np.zeros(n_grid, bool) for _ in range(len(fleet))]
+
+    # schedule most-constrained cars first (least slack = fewest spare intervals)
+    slack = (fleet["dead_idx"] - fleet["plug_idx"] - fleet["intervals_needed"]).values
+    for ci in np.argsort(slack):
+        car = fleet.iloc[ci]
+        lo, hi = car.plug_idx, min(car.dead_idx, n_grid - 1)
+        if hi <= lo:
+            continue
+        window = np.arange(lo, hi + 1)
+        by_price = window[np.argsort(prices[window], kind="stable")]
+        need = int(car.intervals_needed)
+        chosen = [iv for iv in by_price if committed[iv] < slots[iv]][:need]
+        # if the cheap-and-free slots ran out, fall back to cheapest remaining so
+        # the car still meets its deadline (should be rare given ample capacity)
+        if len(chosen) < need:
+            for iv in by_price:
+                if iv not in chosen:
+                    chosen.append(iv)
+                    if len(chosen) == need:
+                        break
+        for iv in chosen:
+            committed[iv] += 1
+        masks[ci][chosen] = True
+    return _finalise(name, masks, fleet, df, cfg)
+
+
+def run_decentralised(name, fleet, df, cfg, rng):
+    """DECENTRALISED (realistic, no central authority). Steps through time. At
+    each 5-min interval every plugged-in car independently looks at how loaded
+    the transformer already is and decides whether to charge: it backs off if the
+    grid is unhealthy or the box is near full — UNLESS its deadline forces it on.
+    Like drivers merging with no traffic cop: usually smooth, but when several
+    cars hit their deadline at once they pile on and briefly overload. Reduces the
+    spike a lot; can't *guarantee* zero the way a central cap does."""
+    n_grid = len(df)
+    health = df["health"].values
+    baseline = baseline_load(df, cfg)
+    kw = cfg.charger_kw
+    remaining = fleet["intervals_needed"].values.astype(int).copy()
+    plug = fleet["plug_idx"].values
+    dead = fleet["dead_idx"].values
+    masks = [np.zeros(n_grid, bool) for _ in range(len(fleet))]
+
+    for i in range(n_grid):
+        load = baseline[i]
+        active = [ci for ci in range(len(fleet))
+                  if plug[ci] <= i <= dead[ci] and remaining[ci] > 0]
+        rng.shuffle(active)                            # no privileged ordering
+        p_health = float(np.clip((health[i] - 4) / 6, 0, 1))  # 4->0 .. 10->1
+        for ci in active:
+            slots_left = dead[ci] - i + 1              # intervals left incl. now
+            must = remaining[ci] >= slots_left          # no slack -> deadline forces it
+            headroom = cfg.transformer_kva - load
+            if must:
+                charge = True                           # deadline override (may overload)
+            else:
+                charge = (headroom >= kw) and (rng.random() < p_health)
+            if charge:
+                masks[ci][i] = True
+                remaining[ci] -= 1
+                load += kw
+    return _finalise(name, masks, fleet, df, cfg)
+
+
+# ----------------------------------------------------------------------------
 # Baseline household load at the transformer  (NOT the state MW demand!)
 # ----------------------------------------------------------------------------
 
@@ -423,12 +528,16 @@ COLORS = {
     "fixed_2300":   "#f4a261",
     "smart_greedy": "#8d99ae",
     "smart_stagger":"#2a9d8f",
+    "smart_decentral": "#4361ee",
+    "smart_capped": "#7209b7",
 }
 LABELS = {
     "naive_plugin": "Naive: charge on plug-in",
     "fixed_2300":   "Fixed 11pm (Tesla default)",
     "smart_greedy": "Smart, no stagger (Layer 1)",
     "smart_stagger":"Smart + stagger (Layer 1+2)",
+    "smart_decentral": "Coordinated: decentralised (realistic)",
+    "smart_capped": "Coordinated: central cap (best case)",
 }
 
 
@@ -531,6 +640,36 @@ def plot_battery(df, no_batt, with_batt, base_no, base_with, cfg, path, xlim=Non
     plt.close(fig)
 
 
+def plot_coordination(df, results_by_name, baseline, cfg, path, xlim=None):
+    """The solution arc: no coordination (greedy, CF~1.0) -> price stagger ->
+    decentralised local awareness -> central cap. Shows the peak coming down as
+    coordination increases."""
+    fig, ax = plt.subplots(figsize=(12, 6.2))
+    t = df["dt"]
+    ax.fill_between(t, 0, baseline, color=GRID, alpha=0.7,
+                    label="Household baseline (non-EV)", zorder=1)
+    for name in ["smart_greedy", "smart_stagger", "smart_decentral", "smart_capped"]:
+        r = results_by_name[name]
+        ax.plot(t, baseline + r["ev_load"], color=COLORS[name], lw=2.1,
+                label=LABELS[name], zorder=3)
+    ax.axhline(cfg.transformer_kva, color=INK, ls="--", lw=1.4,
+               label=f"Transformer rating ({cfg.transformer_kva:.0f} kVA)")
+    ax.set_ylabel("Transformer load (kW)", color=INK)
+    ax.set_title("From problem to fix — the peak falls as cars coordinate\n"
+                 "Independent 'smart' charging → price stagger → local awareness → central cap",
+                 color=INK, fontsize=11)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%a %H:%M"))
+    ax.xaxis.set_major_locator(mdates.HourLocator(interval=3))
+    ax.grid(True, color=GRID, alpha=0.5)
+    ax.legend(loc="upper left", fontsize=8.5, framealpha=0.95)
+    ax.margins(x=0.01)
+    if xlim:
+        ax.set_xlim(xlim)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
@@ -544,12 +683,18 @@ def main(cfg: Config = None):
     fleet = make_fleet(df, cfg)
     base = baseline_load(df, cfg, with_batteries=False)
 
-    strategies = ["naive_plugin", "fixed_2300", "smart_greedy", "smart_stagger"]
+    strategies = ["naive_plugin", "fixed_2300", "smart_greedy", "smart_stagger",
+                  "smart_decentral", "smart_capped"]
     results = []
     rows = []
     for s in strategies:
         rng = np.random.default_rng(cfg.seed + 100)  # fresh RNG per strategy
-        r = run_strategy(s, fleet, df, cfg, rng)
+        if s == "smart_capped":
+            r = run_capped(s, fleet, df, cfg)
+        elif s == "smart_decentral":
+            r = run_decentralised(s, fleet, df, cfg, rng)
+        else:
+            r = run_strategy(s, fleet, df, cfg, rng)
         results.append(r)
         rows.append(summarise(r, base, cfg))
 
@@ -587,8 +732,14 @@ def main(cfg: Config = None):
     xlim_wide = (lo_t, right)
 
     # ---- outputs ----
-    plot_strategies(df, results, base, cfg, out / "strategies.png", xlim=xlim_tight)
-    greedy_res = next(r for r in results if r["name"] == "smart_greedy")
+    by_name = {r["name"]: r for r in results}
+    problem_results = [by_name[n] for n in
+                       ["naive_plugin", "fixed_2300", "smart_greedy", "smart_stagger"]]
+    plot_strategies(df, problem_results, base, cfg, out / "strategies.png",
+                    xlim=xlim_tight)
+    plot_coordination(df, by_name, base, cfg, out / "coordination.png",
+                      xlim=xlim_tight)
+    greedy_res = by_name["smart_greedy"]
     plot_signal_vs_local(df, greedy_res, base, cfg, out / "signal_vs_local.png",
                          xlim=xlim_wide)
     plot_battery(df, greedy_no, greedy_with, base, base_batt, cfg,

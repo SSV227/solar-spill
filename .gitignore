@@ -12,3 +12,6 @@ qld_decisions.csv
 
 # Mac clutter
 .DS_Store
+
+# Wi-Fi credentials - never commit
+esp32/solarspill_step3_fetch/secrets.h

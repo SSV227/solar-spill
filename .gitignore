@@ -15,3 +15,4 @@ qld_decisions.csv
 
 # Wi-Fi credentials - never commit
 esp32/solarspill_step3_fetch/secrets.h
+esp32/libraries/

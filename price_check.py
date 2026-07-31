@@ -9,5 +9,6 @@ def get_qld_price():
     qld = next(r for r in rows if r["REGIONID"] == "QLD1")
     return qld["SETTLEMENTDATE"], qld["PRICE"], qld["TOTALDEMAND"]
 
-time, price, demand = get_qld_price()
-print(f"[{time}]  QLD price: ${price:.2f}/MWh  ({price/10:.2f} c/kWh)  |  demand: {demand:.0f} MW")
+if __name__ == "__main__":
+    time, price, demand = get_qld_price()
+    print(f"[{time}]  QLD price: ${price:.2f}/MWh  ({price/10:.2f} c/kWh)  |  demand: {demand:.0f} MW")

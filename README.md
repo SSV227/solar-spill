@@ -1,8 +1,10 @@
 # Solar Spill
 
-**A simulation of EV charging on a shared suburban transformer, built on real Queensland grid data, comparing six charging strategies. With a physical ESP32 demonstrator driven by live AEMO prices.**
+**A simulation of EV charging on a shared suburban transformer, built on real Queensland grid data, comparing six charging strategies. With a ten-house ESP32 hardware demonstrator.**
 
 > Every car independently charging in its own cheapest hours is the **worst** strategy tested: all 100 cars switch on in the same five-minute interval, peaking at **157% of the transformer's rating with 42 overloaded intervals**. That is worse than a dumb 11pm timer. Capacity-aware coordination brings the peak to **99.9% with zero overloads, every car still charged by its deadline**, for about 17 cents more per car per night.
+
+**Hardware demonstrator:** ten LEDs are ten houses on one transformer, replaying a real Queensland night. The board's RGB LED is the transformer and turns red when overloaded. Uncoordinated smart charging puts all ten cars on at once; coordinated charging never exceeds six, and every car still finishes by 7am. A video of the demo is available on request.
 
 ![Peak transformer load by strategy](phase3_out/strategies.png)
 
@@ -74,7 +76,9 @@ AEMO ELEC_NEM_SUMMARY  (live 5-minute QLD price and demand)
                                       six strategies
         |
         v
-    server.py --> Flask /decision --> ESP32-S3 over Wi-Fi --> LEDs
+    server.py --> Flask /decision, /suburb --> ESP32-S3 over Wi-Fi --> 10 LEDs
+        ^
+  suburb_demo.py  (10 houses, one real night, smart vs coordinated)
 ```
 
 **1. Data pipeline.** `price_check.py` and `logger.py` poll AEMO every five minutes and log to CSV with dropout handling. `graph.py` plots price against demand.
@@ -83,7 +87,16 @@ AEMO ELEC_NEM_SUMMARY  (live 5-minute QLD price and demand)
 
 **3. Simulation.** `simulation.py` runs 100 homes on one transformer through six strategies, each car running the Phase 2 planner, and reports peak load, coincidence factor, overloads, cost and deadline compliance.
 
-**4. Physical demonstrator.** `server.py` serves the live decision as JSON from a Flask endpoint, with a cache so AEMO is called once per settlement interval. An ESP32-S3 polls it over Wi-Fi and drives an LED that switches with the live Queensland grid. A ten-LED board representing ten houses on one transformer is wired and verified. Sketches in [`esp32/`](esp32/), hardware notes in [`HARDWARE.md`](HARDWARE.md).
+**4. Physical demonstrator.** `server.py` serves the live decision as JSON from a Flask endpoint, with a cache so AEMO is called once per settlement interval. An ESP32-S3 polls it over Wi-Fi and drives an LED that switches with the live Queensland grid.
+
+The ten-house demonstrator (`suburb_demo.py`, [`esp32/solarspill_suburb/`](esp32/solarspill_suburb/)) replays the night of 2 July 2026 for ten houses on one transformer with capacity for six chargers at once:
+
+| Strategy | Peak cars charging | Overloaded intervals | Deadlines met |
+|---|---|---|---|
+| Smart, uncoordinated | 10 of 10 | 42 | 10/10 |
+| Coordinated (capacity-aware) | 6 | 0 | 10/10 |
+
+The onboard RGB LED shows the transformer (green within capacity, red overloaded) and the BOOT button switches strategy and restarts the night. Sketches in [`esp32/`](esp32/), hardware notes in [`HARDWARE.md`](HARDWARE.md).
 
 ---
 
@@ -110,10 +123,11 @@ pip install -r requirements.txt
 python price_check.py     # one live AEMO reading
 python decision.py        # decision engine self-test
 python simulation.py      # full simulation, writes plots to phase3_out/
+python suburb_demo.py     # ten-house demo results, smart vs coordinated
 python server.py          # Flask endpoint for the ESP32, port 5001
 ```
 
-The ESP32 sketch needs a `secrets.h` with your Wi-Fi details (copy `secrets.h.example`) and the ArduinoJson library from the Arduino Library Manager.
+Each ESP32 sketch needs a `secrets.h` with your Wi-Fi details (copy `esp32/solarspill_step3_fetch/secrets.h.example` into the sketch folder) and `SERVER_URL`/`SERVER_BASE` set to your computer's IP. Install the ArduinoJson library from the Arduino Library Manager.
 
 ---
 
@@ -123,7 +137,6 @@ The ESP32 sketch needs a `secrets.h` with your Wi-Fi details (copy `secrets.h.ex
 - Fairness metrics: who waits longest, and is it always the same households
 - EV penetration sweep: the adoption level at which each strategy first overloads
 - Replace the known-price planner with a forecast and urgency override
-- Ten-LED demonstrator switching between uncoordinated and coordinated modes
 
 ---
 
